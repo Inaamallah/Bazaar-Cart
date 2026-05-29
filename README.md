@@ -33,8 +33,8 @@ Follow these steps to run the agent locally on your machine.
 
 ### 1. Clone the repository
 ```bash
-git clone [https://github.com/yourusername/bazaar-ai-agent.git](https://github.com/yourusername/bazaar-ai-agent.git)
-cd bazaar-ai-agent
+git clone https://github.com/Inaamallah/Bazaar-Cart.git
+cd Bazaar-Cart
 
 ```
 
