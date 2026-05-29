@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+env/
+.venv/
+venv/
+
+
+# Local secrets and environment
+.env
+.env.*
+run_bazaar_cart.ps1
+
+# App/runtime logs
+*.log
+fastapi.err.log
+fastapi.log
+streamlit.err.log
+streamlit.log
+
+# Streamlit local config
+.streamlit/
+
+# Temporary databases and local scratch files
+*_test.db
+*.sqlite-journal
+*.db-journal
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
