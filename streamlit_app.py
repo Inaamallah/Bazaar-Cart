@@ -1,21 +1,23 @@
 from __future__ import annotations
 
+import json
 import os
 import re
+import sqlite3
+from contextlib import closing
+from pathlib import Path
 from typing import Any
 
 import pandas as pd
-import requests
 import streamlit as st
 from dotenv import load_dotenv
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+
+from shopping_agent import SYSTEM_PROMPT, _checkout, _search_products, continue_agent_conversation
 
 
 APP_NAME = "Bazaar Cart"
-DEFAULT_API_URL = "http://localhost:8000"
-
-
-def api_base_url() -> str:
-    return os.getenv("BAZAAR_CART_API_URL", DEFAULT_API_URL).rstrip("/")
+DB_PATH = Path(__file__).with_name("shopping_agent.db")
 
 
 def clean_assistant_text(content: str) -> str:
@@ -26,47 +28,26 @@ def clean_assistant_text(content: str) -> str:
     return re.sub(r"</?[^>]+>", "", content).strip()
 
 
-def api_request(method: str, path: str, **kwargs: Any) -> dict[str, Any]:
-    url = f"{api_base_url()}{path}"
-    try:
-        response = requests.request(method, url, timeout=90, **kwargs)
-        response.raise_for_status()
-        return response.json()
-    except requests.RequestException as exc:
-        raise RuntimeError(f"Could not reach the {APP_NAME} API at {url}. Start FastAPI first. Details: {exc}") from exc
+def query_table(sql: str, params: tuple[Any, ...] = ()) -> pd.DataFrame:
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        return pd.read_sql_query(sql, conn, params=params)
 
 
 def get_metrics() -> dict[str, Any]:
-    return api_request("GET", "/metrics")
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        product_count = conn.execute("SELECT COUNT(*) FROM products").fetchone()[0]
+        order_count = conn.execute("SELECT COUNT(*) FROM orders").fetchone()[0]
+        review_count = conn.execute("SELECT COUNT(*) FROM reviews").fetchone()[0]
+        revenue = conn.execute(
+            "SELECT COALESCE(SUM(total_price), 0) FROM orders WHERE status = 'paid'"
+        ).fetchone()[0]
 
-
-def search_products(query: str, limit: int) -> list[dict[str, Any]]:
-    data = api_request("POST", "/products/search", json={"query": query, "limit": limit})
-    return data.get("products", [])
-
-
-def checkout(
-    customer_name: str,
-    product_query: str,
-    quantity: int,
-    action: str,
-    shipping_address: str,
-) -> dict[str, Any]:
-    return api_request(
-        "POST",
-        "/checkout",
-        json={
-            "customer_name": customer_name,
-            "product_query": product_query,
-            "quantity": quantity,
-            "action": action,
-            "shipping_address": shipping_address,
-        },
-    )
-
-
-def get_orders() -> list[dict[str, Any]]:
-    return api_request("GET", "/orders").get("orders", [])
+    return {
+        "products": product_count,
+        "orders": order_count,
+        "reviews": review_count,
+        "revenue": float(revenue),
+    }
 
 
 def reset_chat() -> None:
@@ -83,6 +64,26 @@ def initialize_state() -> None:
         reset_chat()
     if "last_search_query" not in st.session_state:
         st.session_state.last_search_query = "headphones under 100"
+
+
+def agent_messages_from_history(customer_name: str, shipping_address: str, prompt: str) -> list[Any]:
+    messages: list[Any] = [SystemMessage(content=SYSTEM_PROMPT)]
+    for item in st.session_state.chat_messages[-10:]:
+        if item["role"] == "user":
+            messages.append(HumanMessage(content=item["content"]))
+        elif item["role"] == "assistant":
+            messages.append(AIMessage(content=item["content"]))
+
+    messages.append(
+        HumanMessage(
+            content=(
+                f"Customer name: {customer_name or 'Guest'}\n"
+                f"Shipping address: {shipping_address or 'not provided'}\n"
+                f"Customer request: {prompt}"
+            )
+        )
+    )
+    return messages
 
 
 def product_rows(products: list[dict[str, Any]]) -> pd.DataFrame:
@@ -137,20 +138,20 @@ def render_product_actions(products: list[dict[str, Any]], customer_name: str, s
                     st.error("Enter a shipping address before purchasing.")
                     continue
 
-                try:
-                    result = checkout(
-                        customer_name=customer_name,
-                        product_query=str(product["sku"]),
-                        quantity=int(quantity),
-                        action=action,
-                        shipping_address=shipping_address,
-                    )
-                    if result.get("success"):
-                        st.success(result["message"])
-                    else:
-                        st.error(result.get("message", "Checkout could not be completed."))
-                except RuntimeError as exc:
-                    st.error(str(exc))
+                result = _checkout(
+                    customer_name=customer_name,
+                    product_query=str(product["sku"]),
+                    quantity=int(quantity),
+                    action=action,
+                    shipping_address=shipping_address,
+                )
+                if isinstance(result, str):
+                    result = json.loads(result)
+
+                if result.get("success"):
+                    st.success(result["message"])
+                else:
+                    st.error(result.get("message", "Checkout could not be completed."))
 
 
 def render_chat(customer_name: str, shipping_address: str) -> None:
@@ -166,8 +167,8 @@ def render_chat(customer_name: str, shipping_address: str) -> None:
     if not prompt:
         return
 
+    agent_messages = agent_messages_from_history(customer_name, shipping_address, prompt)
     st.session_state.chat_messages.append({"role": "user", "content": prompt})
-    history = st.session_state.chat_messages[:-1]
 
     with chat_container:
         with st.chat_message("user"):
@@ -176,19 +177,10 @@ def render_chat(customer_name: str, shipping_address: str) -> None:
         with st.chat_message("assistant"):
             with st.spinner("Thinking through the catalog..."):
                 try:
-                    data = api_request(
-                        "POST",
-                        "/chat",
-                        json={
-                            "message": prompt,
-                            "customer_name": customer_name,
-                            "shipping_address": shipping_address,
-                            "history": history,
-                        },
-                    )
-                    response = clean_assistant_text(data.get("response", ""))
-                except RuntimeError as exc:
-                    response = str(exc)
+                    response, _ = continue_agent_conversation(agent_messages)
+                    response = clean_assistant_text(response)
+                except Exception as exc:
+                    response = f"I could not complete that request: {exc}"
 
     st.session_state.chat_messages.append({"role": "assistant", "content": response})
     st.rerun()
@@ -206,11 +198,7 @@ def render_search(customer_name: str, shipping_address: str) -> None:
         limit = st.number_input("Limit", min_value=1, max_value=25, value=8)
 
     st.session_state.last_search_query = query
-    try:
-        products = search_products(query, int(limit)) if query.strip() else []
-    except RuntimeError as exc:
-        st.error(str(exc))
-        products = []
+    products = _search_products(query, limit=int(limit)) if query.strip() else []
 
     if products:
         st.dataframe(product_rows(products), hide_index=True, width="stretch")
@@ -219,13 +207,24 @@ def render_search(customer_name: str, shipping_address: str) -> None:
 
 
 def render_orders() -> None:
-    try:
-        orders = get_orders()
-    except RuntimeError as exc:
-        st.error(str(exc))
-        orders = []
-
-    st.dataframe(pd.DataFrame(orders), hide_index=True, width="stretch")
+    orders = query_table(
+        """
+        SELECT
+            orders.id,
+            orders.customer_name,
+            products.name AS product,
+            orders.quantity,
+            orders.total_price,
+            orders.status,
+            orders.shipping_address,
+            orders.created_at
+        FROM orders
+        JOIN products ON products.id = orders.product_id
+        ORDER BY orders.id DESC
+        LIMIT 100
+        """
+    )
+    st.dataframe(orders, hide_index=True, width="stretch")
 
 
 def main() -> None:
@@ -248,23 +247,19 @@ def main() -> None:
         st.title(APP_NAME)
         customer_name = st.text_input("Customer name", value="Guest")
         shipping_address = st.text_area("Shipping address", value="", height=90)
-        st.caption(f"API: `{api_base_url()}`")
         st.divider()
         if st.button("Reset chat", width="stretch"):
             reset_chat()
             st.rerun()
 
-        try:
-            metrics = get_metrics()
-            st.metric("Products", metrics["products"])
-            st.metric("Reviews", metrics["reviews"])
-            st.metric("Orders", metrics["orders"])
-            st.metric("Paid revenue", f"${float(metrics['revenue']):.2f}")
-        except RuntimeError as exc:
-            st.error(str(exc))
+        metrics = get_metrics()
+        st.metric("Products", metrics["products"])
+        st.metric("Reviews", metrics["reviews"])
+        st.metric("Orders", metrics["orders"])
+        st.metric("Paid revenue", f"${metrics['revenue']:.2f}")
 
     st.title(APP_NAME)
-    st.caption("AI storefront powered by a FastAPI backend and SQLite catalog.")
+    st.caption(f"AI storefront powered by Streamlit and SQLite. Model: `{os.getenv('GROQ_MODEL', 'openai/gpt-oss-20b')}`")
 
     tab_chat, tab_search, tab_orders = st.tabs(["Chat", "Catalog", "Orders"])
     with tab_chat:

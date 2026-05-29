@@ -1,8 +1,5 @@
-fastapi
 langchain
 langchain-groq
 pandas
 python-dotenv
-requests
 streamlit
-uvicorn
